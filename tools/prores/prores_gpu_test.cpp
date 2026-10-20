@@ -30,10 +30,12 @@ namespace {
       } \
     } while (0)
 
-  // BT.709 limited range, 10-bit code values normalized by 1023 (video::color_vectors_from_colorspace shape).
+  // BT.709-like limited range, 10-bit code values normalized by 1023 (video::color_vectors_from_colorspace shape).
+  // The luma weights are deliberately not the 4-digit BT.709 constants: with those, 8-bit input produces many
+  // values exactly on a .5 rounding tie, where the GPU (half to even) and the CPU (half away) legitimately differ.
   pyrowave::d3d11::color_matrix_t bt709_limited() {
     pyrowave::d3d11::color_matrix_t m {};
-    const float kr = 0.2126f, kb = 0.0722f, kg = 1.0f - kr - kb;
+    const float kr = 0.212639f, kb = 0.072192f, kg = 1.0f - kr - kb;
     const float v_div = 2.0f * (1.0f - kr), u_div = 2.0f * (1.0f - kb);
     const float y[4] = {kr, kg, kb, 0.0f};
     const float u[4] = {-kr / u_div, -kg / u_div, 0.5f, 0.5f};
@@ -191,51 +193,6 @@ namespace {
     std::printf("  coefficients %zu: exact %.3f%%, within 2 %zu, beyond 2 %zu (max diff %d)\n", cpu.size(), exact_pct, off_by_one, bad, max_diff);
     std::printf("  diff histogram 0..7+: %zu %zu %zu %zu %zu %zu %zu %zu\n", histogram[0], histogram[1], histogram[2], histogram[3], histogram[4], histogram[5], histogram[6], histogram[7]);
     if (bad) {
-      // Debug: locate the luma block of the first bad coefficient and compare reconstructed GPU samples with the CPU samples.
-      const auto &sl_list = layout.slices;
-      for (std::size_t si = 0; si < sl_list.size(); si++) {
-        const auto &sl = sl_list[si];
-        const std::size_t end = sl.coeff_offset[0] + std::size_t(sl.mbs) * 4 * 64;
-        if (first_bad >= sl.coeff_offset[0] && first_bad < end) {
-          const std::size_t rel = first_bad - sl.coeff_offset[0];
-          const std::size_t bps = std::size_t(sl.mbs) * 4;
-          const int b = int(rel % bps);
-          const int mbx = sl.mb_x + b / 4, blk = b % 4;
-          const int x0 = mbx * 16 + (blk & 1) * 8, y0 = sl.mb_y * 16 + (blk >> 1) * 8;
-          std::printf("  block at x0=%d y0=%d (scan pos %zu)\n", x0, y0, rel / bps);
-          for (int pass = 0; pass < 2; pass++) {
-            const std::int16_t *src = pass ? cpu.data() : gpu.data();
-            // inverse DCT of the whole block, 1/4 scale
-            double blockc[8][8];
-            static const int scan[64] = {0,1,8,9,2,3,10,11,16,17,24,25,18,19,26,27,4,5,12,20,13,6,7,14,21,28,29,22,15,23,30,31,32,33,40,48,41,34,35,42,49,56,57,50,43,36,37,44,51,58,59,52,45,38,39,46,53,60,61,54,47,55,62,63};
-            for (int pos = 0; pos < 64; pos++) {
-              blockc[scan[pos] / 8][scan[pos] % 8] = src[sl.coeff_offset[0] + std::size_t(pos) * bps + b] / 4.0;
-            }
-            std::printf("  %s samples:\n", pass ? "cpu" : "gpu");
-            for (int r = 0; r < 8; r++) {
-              for (int c = 0; c < 8; c++) {
-                double v = 0;
-                for (int k = 0; k < 8; k++) {
-                  for (int l = 0; l < 8; l++) {
-                    v += blockc[k][l] * (k ? 0.5 : std::sqrt(0.125)) * std::cos((2 * r + 1) * k * 3.14159265358979 / 16) * (l ? 0.5 : std::sqrt(0.125)) * std::cos((2 * c + 1) * l * 3.14159265358979 / 16);
-                  }
-                }
-                std::printf(" %6.1f", v);
-              }
-              std::printf("\n");
-            }
-          }
-          std::printf("  bgra:\n");
-          for (int r = 0; r < 8; r++) {
-            for (int c = 0; c < 8; c++) {
-              const unsigned char *px = &bgra[(std::size_t(std::min(y0 + r, h - 1)) * w + std::min(x0 + c, w - 1)) * 4];
-              std::printf(" %02x%02x%02x", px[2], px[1], px[0]);
-            }
-            std::printf("\n");
-          }
-          break;
-        }
-      }
       std::printf("  first bad index %zu: gpu %d cpu %d\n", first_bad, gpu[first_bad], cpu[first_bad]);
     }
     CHECK(bad == 0);
