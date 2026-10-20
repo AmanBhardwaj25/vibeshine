@@ -47,7 +47,7 @@ cbuffer params_cbuffer : register(b2) {
     uint blank;             // nonzero: black everywhere
     int rotate_texture_steps;  // quarter turns, as in base_vs.hlsl
     uint mb_width;
-    uint padding;
+    uint direct;            // nonzero: the picture maps 1:1 onto output pixels (integer offset, no rotation), so read texels exactly
 };
 
 #ifdef YUV444
@@ -91,6 +91,13 @@ float2 rotate_uv(float2 uv)
 // Unconverted source colour at an output pixel centre; black outside the picture.
 float3 fetch(float2 out_pos)
 {
+    if (direct != 0) {
+        int2 p = int2(floor(out_pos - content_offset));
+        if (blank != 0 || any(p < 0) || any(p >= int2(round(1.0 / content_scale)))) {
+            return 0.0;
+        }
+        return image.Load(int3(p, 0)).rgb;
+    }
     float2 uv = (out_pos - content_offset) * content_scale;
     if (blank != 0 || any(uv < 0.0) || any(uv > 1.0)) {
         return 0.0;

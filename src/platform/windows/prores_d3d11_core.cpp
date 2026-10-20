@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <map>
 
@@ -31,7 +32,8 @@ namespace prores::d3d11 {
       std::uint32_t blank;
       std::int32_t rotate_texture_steps;
       std::uint32_t mb_width;
-      std::uint32_t padding[3];
+      std::uint32_t direct;  ///< 1:1 mapping: the shader loads texels instead of sampling
+      std::uint32_t padding[2];
     };
 
     static_assert(sizeof(dct_params_t) % 16 == 0, "Constant buffers are sized in 16-byte units");
@@ -263,6 +265,8 @@ namespace prores::d3d11 {
         p.content_offset[1] = (float(config.height) - content_h) * 0.5f;
         p.content_scale[0] = 1.0f / content_w;
         p.content_scale[1] = 1.0f / content_h;
+        p.direct = (source->rotate_texture_steps & 3) == 0 && content_w == source_w && content_h == source_h &&
+                   p.content_offset[0] == std::floor(p.content_offset[0]) && p.content_offset[1] == std::floor(p.content_offset[1]);
       }
       if (!params_valid || std::memcmp(&p, &last_params, sizeof(p)) != 0) {
         context->UpdateSubresource(params.Get(), 0, nullptr, &p, 0, 0);
