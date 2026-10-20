@@ -31,7 +31,7 @@ namespace prores::d3d11 {
       std::uint32_t blank;
       std::int32_t rotate_texture_steps;
       std::uint32_t mb_width;
-      std::uint32_t padding;
+      std::uint32_t padding[3];
     };
 
     static_assert(sizeof(dct_params_t) % 16 == 0, "Constant buffers are sized in 16-byte units");
