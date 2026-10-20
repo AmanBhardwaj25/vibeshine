@@ -16,3 +16,10 @@ target_link_libraries(prores_selftest prores_ref)
 
 add_executable(prores_ref_encode prores_ref_encode.cpp)
 target_link_libraries(prores_ref_encode prores_ref)
+
+if(WIN32)
+  set(REPO_ROOT ${CMAKE_CURRENT_LIST_DIR}/../..)
+  add_executable(prores_gpu_test prores_gpu_test.cpp ${REPO_ROOT}/src/platform/windows/prores_d3d11_core.cpp)
+  target_include_directories(prores_gpu_test PRIVATE ${REPO_ROOT})
+  target_link_libraries(prores_gpu_test prores_ref d3d11 dxgi d3dcompiler)
+endif()

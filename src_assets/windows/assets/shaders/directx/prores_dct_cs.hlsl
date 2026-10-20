@@ -1,0 +1,223 @@
+// RGB -> 10-bit Y'CbCr -> 8x8 DCT for the ProRes encoder (src/platform/windows/prores_d3d11_core.cpp).
+//
+// One thread group per 16x16 macroblock. Every thread converts one pixel with the same
+// colour math as convert_pyrowave_cs.hlsl (CONVERT_FUNCTION from the transfer-function
+// include, colour matrix cbuffer, letterbox and rotation), the group builds the 10-bit
+// samples of the macroblock (4:2:2 chroma is the average of each horizontal pixel pair
+// before rounding), runs the orthonormal 8x8 DCT on every block and stores
+// trunc(4 * coefficient) as int16 in the slice scan order of docs/prores-protocol.md
+// section 3.5: index = coeff_offset[plane] + scan_position * blocks_per_slice + block.
+//
+//   PQ          FP16 scRGB capture, HDR stream: Rec. 2100 PQ
+//   LINEAR      FP16 scRGB capture, SDR stream: sRGB curve
+//   SDR_TO_PQ   UNORM (sRGB) capture, HDR stream: SDR white placed at sdr_white_nits
+//   (none)      UNORM capture, SDR stream: values are already display encoded
+//   YUV444      full resolution chroma (otherwise 4:2:2)
+//
+// The coeffs buffer must be zeroed before the dispatch: int16 values are ORed in.
+
+#if defined(PQ)
+  #include "include/convert_perceptual_quantizer_base.hlsl"
+#elif defined(LINEAR)
+  #include "include/convert_linear_base.hlsl"
+#elif defined(SDR_TO_PQ)
+  #include "include/convert_sdr_to_pq_base.hlsl"  // declares cbuffer b1
+#else
+  #include "include/convert_base.hlsl"
+#endif
+
+Texture2D image : register(t0);
+StructuredBuffer<uint4> mb_info : register(t1);  // per macroblock: coeff offsets y, cb, cr; mb_in_slice | mbs << 16
+SamplerState def_sampler : register(s0);
+
+RWByteAddressBuffer coeffs : register(u0);
+
+cbuffer color_matrix_cbuffer : register(b0) {
+    float4 color_vec_y;
+    float4 color_vec_u;
+    float4 color_vec_v;
+    float2 range_y;
+    float2 range_uv;
+};
+
+cbuffer params_cbuffer : register(b2) {
+    uint2 luma_size;        // picture extent in pixels
+    float2 content_offset;  // top-left of the picture in output pixels
+    float2 content_scale;   // 1 / picture size in output pixels
+    uint blank;             // nonzero: black everywhere
+    int rotate_texture_steps;  // quarter turns, as in base_vs.hlsl
+    uint mb_width;
+    uint padding;
+};
+
+#ifdef YUV444
+  #define BLOCKS_CHROMA 4
+#else
+  #define BLOCKS_CHROMA 2
+#endif
+#define NUM_BLOCKS (4 + 2 * BLOCKS_CHROMA)
+
+// Raster index -> scan position (inverse of progressive_scan, docs section 3.5).
+static const uint inv_scan[64] = {
+    0, 1, 4, 5, 16, 17, 21, 22,
+    2, 3, 6, 7, 18, 20, 23, 28,
+    8, 9, 12, 13, 19, 24, 27, 29,
+    10, 11, 14, 15, 25, 26, 30, 31,
+    32, 33, 37, 38, 45, 46, 53, 54,
+    34, 36, 39, 44, 47, 52, 55, 60,
+    35, 40, 43, 48, 51, 56, 59, 61,
+    41, 42, 49, 50, 57, 58, 62, 63
+};
+
+groupshared float2 gs_uv[16][16];          // unrounded chroma code values per pixel
+groupshared float gs_sample[3][16][16];    // 10-bit samples per plane (chroma at its own resolution)
+groupshared float gs_tmp[NUM_BLOCKS][8][8];
+
+// Rotate a texture coordinate about the centre, like generate_fullscreen_triangle_vertex().
+float2 rotate_uv(float2 uv)
+{
+    switch (((rotate_texture_steps % 4) + 4) % 4) {
+        case 1:
+            return float2(1.0 - uv.y, uv.x);
+        case 2:
+            return float2(1.0 - uv.x, 1.0 - uv.y);
+        case 3:
+            return float2(uv.y, 1.0 - uv.x);
+        default:
+            return uv;
+    }
+}
+
+// Unconverted source colour at an output pixel centre; black outside the picture.
+float3 fetch(float2 out_pos)
+{
+    float2 uv = (out_pos - content_offset) * content_scale;
+    if (blank != 0 || any(uv < 0.0) || any(uv > 1.0)) {
+        return 0.0;
+    }
+    return image.SampleLevel(def_sampler, rotate_uv(uv), 0).rgb;
+}
+
+float to_y(float3 rgb)
+{
+    return (dot(color_vec_y.xyz, rgb) + color_vec_y.w) * range_y.x + range_y.y;
+}
+
+float2 to_uv(float3 rgb)
+{
+    float u = dot(color_vec_u.xyz, rgb) + color_vec_u.w;
+    float v = dot(color_vec_v.xyz, rgb) + color_vec_v.w;
+    return float2(u, v) * range_uv.x + range_uv.y;
+}
+
+float code10(float normalized)
+{
+    return clamp(round(normalized * 1023.0), 0.0, 1023.0);
+}
+
+// Orthonormal DCT-II basis: dct_c[k][n] = c(k) * cos((2n + 1) k pi / 16).
+float dct_c(uint k, uint n)
+{
+    const float c0 = 0.35355339059327373;  // 1 / sqrt(8)
+    const float c1 = 0.5;                  // sqrt(2 / 8)
+    return (k == 0 ? c0 : c1) * cos(float((2 * n + 1) * k) * 0.19634954084936207);  // pi / 16
+}
+
+// Sample origin of block `i` of a plane inside gs_sample (docs section 3.5 block orders).
+uint2 block_origin(uint plane, uint i)
+{
+    if (plane == 0) {
+        return uint2((i & 1) * 8, (i >> 1) * 8);
+    }
+#ifdef YUV444
+    return uint2((i >> 1) * 8, (i & 1) * 8);
+#else
+    return uint2(0, i * 8);
+#endif
+}
+
+[numthreads(16, 16, 1)]
+void main_cs(uint2 mb : SV_GroupID, uint2 t : SV_GroupThreadID, uint tid : SV_GroupIndex)
+{
+    // Pixels beyond the picture repeat the last row and column.
+    uint2 pixel = min(mb * 16 + t, luma_size - 1);
+    float3 rgb = CONVERT_FUNCTION(fetch(float2(pixel) + 0.5));
+    gs_sample[0][t.y][t.x] = code10(to_y(rgb));
+    gs_uv[t.y][t.x] = to_uv(rgb) * 1023.0;
+    GroupMemoryBarrierWithGroupSync();
+
+#ifdef YUV444
+    gs_sample[1][t.y][t.x] = clamp(round(gs_uv[t.y][t.x].x), 0.0, 1023.0);
+    gs_sample[2][t.y][t.x] = clamp(round(gs_uv[t.y][t.x].y), 0.0, 1023.0);
+#else
+    if (t.x < 8) {
+        // Chroma column cx covers pixels 2 * cx and 2 * cx + 1 (both clamped to the picture);
+        // columns beyond the picture repeat the last one.
+        uint cx = mb.x * 8 + t.x;
+        uint cxc = min(cx, (luma_size.x + 1) / 2 - 1);
+        float2 a, b;
+        if (cxc == cx) {
+            a = gs_uv[t.y][t.x * 2];
+            b = gs_uv[t.y][t.x * 2 + 1];
+        } else {
+            uint y = min(mb.y * 16 + t.y, luma_size.y - 1);
+            a = to_uv(CONVERT_FUNCTION(fetch(float2(min(cxc * 2, luma_size.x - 1), y) + 0.5))) * 1023.0;
+            b = to_uv(CONVERT_FUNCTION(fetch(float2(min(cxc * 2 + 1, luma_size.x - 1), y) + 0.5))) * 1023.0;
+        }
+        float2 c = clamp(round((a + b) * 0.5), 0.0, 1023.0);
+        gs_sample[1][t.y][t.x] = c.x;
+        gs_sample[2][t.y][t.x] = c.y;
+    }
+#endif
+    GroupMemoryBarrierWithGroupSync();
+
+    // Row pass: task = (block, row).
+    uint blk = tid >> 3;
+    uint lane = tid & 7;
+    uint plane = 0;
+    uint index = blk;
+    if (blk >= 4) {
+        plane = 1 + (blk - 4) / BLOCKS_CHROMA;
+        index = (blk - 4) % BLOCKS_CHROMA;
+    }
+    uint2 origin = block_origin(plane, index);
+    if (blk < NUM_BLOCKS) {
+        float s[8];
+        [unroll] for (uint n = 0; n < 8; n++) {
+            s[n] = gs_sample[plane][origin.y + lane][origin.x + n];
+        }
+        [unroll] for (uint k = 0; k < 8; k++) {
+            float a = 0.0;
+            [unroll] for (uint n = 0; n < 8; n++) {
+                a += dct_c(k, n) * s[n];
+            }
+            gs_tmp[blk][lane][k] = a;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Column pass: task = (block, column). Writes the 8 coefficients of that column.
+    if (blk < NUM_BLOCKS) {
+        uint4 info = mb_info[mb.y * mb_width + mb.x];
+        uint mbs = info.w >> 16;
+        uint mb_in_slice = info.w & 0xFFFF;
+        uint bpm = plane == 0 ? 4 : BLOCKS_CHROMA;
+        uint bps = mbs * bpm;
+        uint block_in_slice = mb_in_slice * bpm + index;
+        uint base = plane == 0 ? info.x : (plane == 1 ? info.y : info.z);
+
+        float s[8];
+        [unroll] for (uint n = 0; n < 8; n++) {
+            s[n] = gs_tmp[blk][n][lane];
+        }
+        [unroll] for (uint k = 0; k < 8; k++) {
+            float a = 0.0;
+            [unroll] for (uint n = 0; n < 8; n++) {
+                a += dct_c(k, n) * s[n];
+            }
+            int value = (int) trunc(4.0 * a);
+            uint e = base + inv_scan[k * 8 + lane] * bps + block_in_slice;  // int16 index
+            coeffs.InterlockedOr((e >> 1) * 4, ((uint) value & 0xFFFF) << ((e & 1) * 16));
+        }
+    }
+}

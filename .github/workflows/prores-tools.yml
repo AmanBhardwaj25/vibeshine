@@ -1,0 +1,54 @@
+name: prores-tools
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - chloroframe-prores
+  workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  tools:
+    name: Build and test tools/prores (Windows, WARP)
+    if: github.repository != 'Nonary/vibeshine'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda  # v2.30.0
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cmake -S tools/prores -B build-prores -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-prores
+
+      - name: Run tests
+        shell: msys2 {0}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          ./build-prores/prores_selftest 2>&1 | tee logs/selftest.log
+          ./build-prores/prores_gpu_test src_assets/windows/assets/shaders/directx 2>&1 | tee logs/gpu_test.log
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: prores-tools-logs
+          path: logs
