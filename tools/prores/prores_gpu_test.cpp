@@ -166,11 +166,16 @@ namespace {
     prores::forward_dct(layout, planes, strides, cpu.data());
 
     CHECK(gpu.size() == cpu.size());
-    std::size_t exact = 0, off_by_one = 0, bad = 0, first_bad = 0;
+    std::size_t exact = 0, off_by_one = 0, bad = 0, first_bad = 0, shown = 0;
+    std::size_t histogram[8] = {};
     int max_diff = 0;
     for (std::size_t i = 0; i < std::min(gpu.size(), cpu.size()); i++) {
       const int d = std::abs(int(gpu[i]) - int(cpu[i]));
       max_diff = std::max(max_diff, d);
+      histogram[std::min(d, 7)]++;
+      if (d > 2 && shown++ < 6) {
+        std::printf("  diff %d at index %zu: gpu %d cpu %d\n", d, i, gpu[i], cpu[i]);
+      }
       if (d == 0) {
         exact++;
       } else if (d <= 2) {
@@ -184,6 +189,7 @@ namespace {
     }
     const double exact_pct = 100.0 * double(exact) / double(cpu.size());
     std::printf("  coefficients %zu: exact %.3f%%, within 2 %zu, beyond 2 %zu (max diff %d)\n", cpu.size(), exact_pct, off_by_one, bad, max_diff);
+    std::printf("  diff histogram 0..7+: %zu %zu %zu %zu %zu %zu %zu %zu\n", histogram[0], histogram[1], histogram[2], histogram[3], histogram[4], histogram[5], histogram[6], histogram[7]);
     if (bad) {
       std::printf("  first bad index %zu: gpu %d cpu %d\n", first_bad, gpu[first_bad], cpu[first_bad]);
     }
