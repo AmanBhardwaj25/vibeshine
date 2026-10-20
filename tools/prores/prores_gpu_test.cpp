@@ -295,7 +295,8 @@ namespace {
       std::printf("  encode time over %zu frames: median %.2f ms, p95 %.2f ms, max %.2f ms\n", ms.size(), ms[ms.size() / 2], ms[std::size_t(double(ms.size() - 1) * 0.95)], ms.back());
     }
 
-    // Artifacts for the Mac-side decode check: 30 frames with budgets from 100 to 700 Mbps.
+    // Artifacts for the Mac-side decode check: 30 frames cycling through the ladder entries 15 down to 6 (q 128 to 16),
+    // each requested with the exact CPU frame size of that entry. (The synthetic image is noisy: Mbps budgets would all land on q 128.)
     {
       const std::string base = out_dir + (yuv444 ? "/prores_gpu_444" : "/prores_gpu_422");
       FILE *bin = std::fopen((base + ".bin").c_str(), "wb");
@@ -305,7 +306,7 @@ namespace {
       if (bin && txt && yuv) {
         for (int f = 0; f < 30; f++) {
           prores::d3d11::frame_stats_t stats;
-          const std::size_t budget = bytes_at(100.0 + 600.0 * f / 29.0);
+          const std::size_t budget = prores::frame_bytes(layout, gpu.data(), ladder[15 - f % 10], config.quant);
           CHECK(core->encode(source, budget, out, critical, &stats) == prores::d3d11::result_e::ok);
           std::fwrite(out.data(), 1, out.size(), bin);
           std::fprintf(txt, "%d %zu %d %zu\n", f, budget, stats.q, out.size());
