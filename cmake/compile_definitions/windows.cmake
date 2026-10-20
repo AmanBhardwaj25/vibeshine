@@ -359,4 +359,12 @@ if(SUNSHINE_ENABLE_PYROWAVE)
             "${CMAKE_SOURCE_DIR}/src/platform/windows/pyrowave_encode.cpp")
 endif()
 
+# ProRes host encoder: pure D3D11 compute, no extra dependencies. Without it,
+# src/prores/prores_host.cpp provides the unavailable stub.
+list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_ENABLE_PRORES=1)
+list(APPEND PLATFORM_TARGET_FILES
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/prores_d3d11_core.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/prores_d3d11_core.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/prores_encode.cpp")
+
 list(APPEND PLATFORM_TARGET_FILES "${CMAKE_SOURCE_DIR}/src/platform/windows/managed_app_focus.cpp")

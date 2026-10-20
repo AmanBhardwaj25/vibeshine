@@ -180,7 +180,7 @@ namespace rtsp_stream {
     // encoder converts on its own device and has no SDR->HDR stage.
     config.rtx_hdr_active = config::runtime_config_override_enabled("rtx_hdr") &&
                             config::video.rtx_hdr.enabled &&
-                            config.videoFormat != pyrowave::protocol::BITSTREAM_FORMAT &&
+                            !pyrowave::protocol::is_intra_format(config.videoFormat) &&
                             config.dynamicRange > 0 &&
                             !config.prefer_sdr_10bit &&
                             !config.force_sdr;
@@ -1678,6 +1678,11 @@ namespace rtsp_stream {
       ss << pyrowave::protocol::DESCRIBE_BITSTREAM_ATTRIBUTE << pyrowave::protocol::BITSTREAM_ID << std::endl;
     }
 
+    // ProRes capability marker and protocol version (docs/prores-protocol.md).
+    if (video::active_prores_mode >= 2) {
+      ss << "a=x-cf-prores:" << prores::protocol::DESCRIBE_VERSION << std::endl;
+    }
+
     if (!session->surround_params.empty()) {
       // If we have our own surround parameters, advertise them twice first
       ss << "a=fmtp:97 surround-params="sv << session->surround_params << std::endl;
@@ -1959,6 +1964,14 @@ namespace rtsp_stream {
     }
 
     const bool pyrowave_session = config.monitor.videoFormat == pyrowave::protocol::BITSTREAM_FORMAT;
+    const bool prores_session = config.monitor.videoFormat == prores::protocol::BITSTREAM_FORMAT;
+    const bool intra_session = pyrowave_session || prores_session;
+    if (prores_session) {
+      // ProRes frames are length-prefixed ProRes frame atoms, never PyroWave records.
+      config.monitor.pyrowave_framing = pyrowave::policy::framing_e::length_prefixed;
+      config.monitor.pyrowave_min_parity_shards = std::max(2, config.minRequiredFecPackets);
+      BOOST_LOG(info) << "Client requested ProRes"sv;
+    }
     if (pyrowave_session) {
       // Aurora's adaptive-FEC attribute or our record-framing feature bit selects
       // record framing; other PyroWave clients get length-prefixed frames.
@@ -2006,7 +2019,8 @@ namespace rtsp_stream {
     const bool hevc_main10 = config.monitor.videoFormat == 1 && video::active_hevc_mode >= 3;
     const bool av1_main10 = config.monitor.videoFormat == 2 && video::active_av1_mode >= 3;
     const bool pyrowave_10bit = pyrowave_session && video::active_pyrowave_mode >= 2;
-    const bool supports_10bit_dynamic_range = hevc_main10 || av1_main10 || pyrowave_10bit;
+    const bool prores_10bit = prores_session && video::active_prores_mode >= 2;
+    const bool supports_10bit_dynamic_range = hevc_main10 || av1_main10 || pyrowave_10bit || prores_10bit;
     config.monitor.force_sdr = session->force_sdr;
     if (prefer_10bit_sdr) {
       if (supports_10bit_dynamic_range) {
@@ -2021,7 +2035,7 @@ namespace rtsp_stream {
     } else if (config.monitor.dynamicRange == 0) {
       // A PyroWave bitstream does not carry its bit depth: the client sizes its planes
       // from the profile it negotiated, so never upgrade an 8-bit PyroWave request.
-      if (session->enable_hdr && supports_10bit_dynamic_range && !pyrowave_session) {
+      if (session->enable_hdr && supports_10bit_dynamic_range && !intra_session) {
         BOOST_LOG(info) << "RTSP ANNOUNCE requested SDR while launch HDR is enabled; using HDR 10-bit encode";
         config.monitor.dynamicRange = 1;
       }
@@ -2029,7 +2043,7 @@ namespace rtsp_stream {
     apply_rtx_hdr_stream_policy(config.monitor);
 
 #if defined(_WIN32) || defined(__linux__)
-    if (pyrowave_session) {
+    if (intra_session) {
       boost::system::error_code local_ec, remote_ec;
       const auto local = socket->sock.local_endpoint(local_ec);
       const auto remote = socket->sock.remote_endpoint(remote_ec);
@@ -2065,7 +2079,7 @@ namespace rtsp_stream {
       // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
       // PyroWave only adds parity to its few critical packets (see stream.cpp), so it
       // reserves its baseline parity and packet overhead in the per-frame budget.
-      if (config::stream.fec_percentage <= 80 && !pyrowave_session) {
+      if (config::stream.fec_percentage <= 80 && !intra_session) {
         configuredBitrateKbps /= 100.f / (100 - config::stream.fec_percentage);
       }
 
@@ -2074,15 +2088,15 @@ namespace rtsp_stream {
       auto audioBitrateAdjustment = (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels;
       // Audio adds two parity packets for every four data packets. Include
       // that fixed 50% FEC cost inside PyroWave's total wire budget too.
-      if (pyrowave_session) audioBitrateAdjustment = (audioBitrateAdjustment * 3 + 1) / 2;
-      configuredBitrateKbps -= pyrowave_session ? audioBitrateAdjustment :
+      if (intra_session) audioBitrateAdjustment = (audioBitrateAdjustment * 3 + 1) / 2;
+      configuredBitrateKbps -= intra_session ? audioBitrateAdjustment :
                                                    std::min((std::int64_t) audioBitrateAdjustment, configuredBitrateKbps / 5);
 
       // Reduce it by another 500Kbps to account for A/V packet overhead and control data
       // traffic (capped at 10% reduction).
-      configuredBitrateKbps -= pyrowave_session ? 500 : std::min((std::int64_t) 500, configuredBitrateKbps / 10);
-      if (pyrowave_session && configuredBitrateKbps <= 0) {
-        BOOST_LOG(warning) << "PyroWave bandwidth budget cannot accommodate audio and control overhead";
+      configuredBitrateKbps -= intra_session ? 500 : std::min((std::int64_t) 500, configuredBitrateKbps / 10);
+      if (intra_session && configuredBitrateKbps <= 0) {
+        BOOST_LOG(warning) << "Intra-only bandwidth budget cannot accommodate audio and control overhead";
         respond(socket->sock, *session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
         return false;
       }
@@ -2100,6 +2114,13 @@ namespace rtsp_stream {
 
     if (config.monitor.videoFormat == 2 && video::active_av1_mode == 1) {
       BOOST_LOG(warning) << "AV1 is disabled, yet the client requested AV1"sv;
+
+      respond(socket->sock, *session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+      return false;
+    }
+
+    if (prores_session && video::active_prores_mode < 2) {
+      BOOST_LOG(warning) << "ProRes is unsupported, yet the client requested ProRes"sv;
 
       respond(socket->sock, *session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
       return false;

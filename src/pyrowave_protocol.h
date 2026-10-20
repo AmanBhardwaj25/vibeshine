@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <string_view>
 
+#include "prores/prores_protocol.h"
+
 namespace pyrowave::protocol {
   // ServerCodecModeSupport bits advertised in /serverinfo.
   constexpr std::uint32_t SCM_PYROWAVE = 0x00800000;  ///< 8-bit 4:2:0
@@ -23,6 +25,12 @@ namespace pyrowave::protocol {
 
   /// `x-nv-vqos[0].bitStreamFormat` value selecting PyroWave (0/1/2 are H.264/HEVC/AV1).
   constexpr int BITSTREAM_FORMAT = 3;
+
+  /// Sessions that send every frame intra-coded through the PyroWave loop and transport:
+  /// PyroWave itself and ProRes (src/prores).
+  constexpr bool is_intra_format(int format) {
+    return format == BITSTREAM_FORMAT || format == prores::protocol::BITSTREAM_FORMAT;
+  }
 
   /// First eight hex digits of the vendored pyrowave commit (third-party/pyrowave/VENDOR.txt).
   /// The PyroWave bitstream carries no version field, so both ends must match.

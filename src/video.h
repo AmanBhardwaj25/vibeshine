@@ -48,7 +48,7 @@ namespace video {
        SDR encoding colorspace (encoderCscMode >> 1) : 0 - BT.601, 1 - BT.709, 2 - BT.2020 */
     int encoderCscMode;
 
-    int videoFormat;  // 0 - H.264, 1 - HEVC, 2 - AV1, 3 - PyroWave
+    int videoFormat;  // 0 - H.264, 1 - HEVC, 2 - AV1, 3 - PyroWave, 4 - ProRes
 
     /* Encoding color depth (bit depth): 0 - 8-bit, 1 - 10-bit
        HDR encoding activates when color depth is higher than 8-bit and the display which is being captured is operating in HDR mode */
@@ -446,6 +446,8 @@ namespace video {
    * selection, so this is independent of the chosen hardware encoder.
    */
   extern std::atomic_int active_pyrowave_mode;
+  /// ProRes (src/prores) encoding on the probed capture adapter; same values as active_pyrowave_mode.
+  extern std::atomic_int active_prores_mode;
   extern bool last_encoder_probe_supported_ref_frames_invalidation;
   extern std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
 
@@ -457,6 +459,7 @@ namespace video {
     int hevc_mode = 0;
     int av1_mode = 0;
     int pyrowave_mode = 0;  ///< Same values as active_pyrowave_mode.
+    int prores_mode = 0;  ///< Same values as active_prores_mode.
     std::array<bool, 3> yuv444_for_codec {};
   };
 

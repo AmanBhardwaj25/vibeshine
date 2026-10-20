@@ -45,6 +45,8 @@ namespace stream {
         return "AV1";
       case 3:
         return "PyroWave";
+      case 4:
+        return "ProRes";
       default:
         return "Unknown";
     }

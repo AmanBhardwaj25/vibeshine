@@ -863,6 +863,7 @@ namespace nvhttp {
           << ", hevc_mode=" << caps.hevc_mode
           << ", av1_mode=" << caps.av1_mode
           << ", pyrowave_mode=" << caps.pyrowave_mode
+          << ", prores_mode=" << caps.prores_mode
           << ", source=" << reason << '.';
         return http_encoder_capabilities_t {
           .advertised = std::move(caps),
@@ -1907,6 +1908,7 @@ namespace nvhttp {
           << ", hevc_mode=" << caps.hevc_mode
           << ", av1_mode=" << caps.av1_mode
           << ", pyrowave_mode=" << caps.pyrowave_mode
+          << ", prores_mode=" << caps.prores_mode
           << ", source=" << reason << '.';
         return http_encoder_capabilities_t {
           .advertised = std::move(caps),
@@ -3791,6 +3793,10 @@ namespace nvhttp {
     // pyrowave_mode is 2 only when the probe passed and the pyrowave option is enabled.
     if (advertised_video.pyrowave_mode >= 2) {
       codec_mode_flags |= pyrowave::protocol::SCM_MASK_PYROWAVE;
+    }
+    // ProRes (src/prores) is likewise independent of the selected encoder.
+    if (advertised_video.prores_mode >= 2) {
+      codec_mode_flags |= prores::protocol::SCM_PRORES_422 | prores::protocol::SCM_PRORES_444;
     }
     tree.put("root.ServerCodecModeSupport", codec_mode_flags);
 

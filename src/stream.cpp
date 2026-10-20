@@ -1465,8 +1465,8 @@ namespace stream {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
       saturating_add_relaxed(session->stats.idr_requests, 1u);
-      // Every PyroWave frame is intra-coded; the next frame already recovers.
-      if (session->config.monitor.videoFormat == pyrowave::protocol::BITSTREAM_FORMAT) {
+      // Every PyroWave and ProRes frame is intra-coded; the next frame already recovers.
+      if (pyrowave::protocol::is_intra_format(session->config.monitor.videoFormat)) {
         return;
       }
       session->video.idr_events->raise(true);
@@ -1495,8 +1495,8 @@ namespace stream {
         << "firstFrame [" << firstFrame << ']' << std::endl
         << "lastFrame [" << lastFrame << ']';
 
-      // PyroWave frames reference nothing (see the IDR handler).
-      if (session->config.monitor.videoFormat == pyrowave::protocol::BITSTREAM_FORMAT) {
+      // Intra-only frames reference nothing (see the IDR handler).
+      if (pyrowave::protocol::is_intra_format(session->config.monitor.videoFormat)) {
         return;
       }
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
@@ -2088,7 +2088,7 @@ namespace stream {
       // recovery keyframe, and the client decodes a frame that lost only finer detail.
       // Critical shards receive baseline parity. Stable pictures at low cadence
       // may also protect detail, bounded by unused bitrate and FEC block capacity.
-      const bool pyrowave_session = session->config.monitor.videoFormat == pyrowave::protocol::BITSTREAM_FORMAT;
+      const bool pyrowave_session = pyrowave::protocol::is_intra_format(session->config.monitor.videoFormat);
       auto fecPercentage = pyrowave_session ? 0 : config::stream.fec_percentage;
 
       // Insert space for packet headers
@@ -2325,7 +2325,7 @@ namespace stream {
 
         // PyroWave record framing: flag the shards that start with a record, where a
         // client that lost a record header resumes parsing.
-        const auto record_starts = critical_shards ?
+        const auto record_starts = critical_shards && session->config.monitor.videoFormat == pyrowave::protocol::BITSTREAM_FORMAT ?
                                      pyrowave::policy::record_start_shards({packet->data(), packet->data_size()}, payload_blocksize) :
                                      std::vector<bool> {};
         std::size_t block_first_shard = 0;

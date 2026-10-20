@@ -45,6 +45,8 @@ extern "C" {
 #include "logging.h"
 #include "nvenc/nvenc_base.h"
 #include "platform/common.h"
+#include "prores/prores_host.h"
+#include "pyrowave_protocol.h"
 #include "pyrowave_host.h"
 #include "sync.h"
 #include "video.h"
@@ -2639,6 +2641,7 @@ namespace video {
   int active_hevc_mode;
   int active_av1_mode;
   std::atomic_int active_pyrowave_mode {0};
+  std::atomic_int active_prores_mode {0};
   bool last_encoder_probe_supported_ref_frames_invalidation = false;
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};
   std::atomic<std::int64_t> last_negative_hdr_advertisement_probe_ns {0};
@@ -5932,12 +5935,12 @@ namespace video {
   }
 
   /**
-   * @brief Stream colorspace and HDR info for a PyroWave session.
+   * @brief Stream colorspace and HDR info for a PyroWave or ProRes session.
    *
    * Shares the source state and metadata lifetime of codec streams.
    * RTX HDR is never active for PyroWave sessions (see rtsp.cpp).
    */
-  sunshine_colorspace_t pyrowave_session_colorspace(platf::display_t &disp, const config_t &config, hdr_info_t &hdr_info) {
+  sunshine_colorspace_t pyrowave_session_colorspace(platf::display_t &disp, const config_t &config, hdr_info_t &hdr_info, std::string_view codec_name) {
     const bool display_is_hdr = disp.is_hdr();
     bool hdr_display = display_is_hdr;
 
@@ -5958,7 +5961,7 @@ namespace video {
                               colorspace.colorspace == colorspace_e::rec709    ? "SDR (Rec. 709)" :
                               colorspace.colorspace == colorspace_e::bt2020sdr ? "SDR (Rec. 2020)" :
                                                                                  "unknown";
-    BOOST_LOG(info) << "Creating encoder [pyrowave]";
+    BOOST_LOG(info) << "Creating encoder [" << codec_name << ']';
     BOOST_LOG(info) << "Color coding: " << color_coding;
     BOOST_LOG(info) << "Color depth: " << colorspace.bit_depth << "-bit";
     BOOST_LOG(info) << "Color range: " << (colorspace.full_range ? "JPEG" : "MPEG");
@@ -5966,7 +5969,7 @@ namespace video {
   }
 
   /**
-   * @brief Encode loop of a PyroWave session (docs/pyrowave-protocol.md).
+   * @brief Encode loop of a PyroWave or ProRes session (docs/pyrowave-protocol.md, docs/prores-protocol.md).
    *
    * PyroWave bypasses encoder_t: every frame is intra-coded, so IDR requests and
    * reference frame invalidation need no action, and a bitrate change only moves the
@@ -6005,9 +6008,11 @@ namespace video {
     const int maximum_wire_kbps = config.client_requested_bitrate > 0 ? config.client_requested_bitrate : config.bitrate;
     const int audio_control_reserve_kbps = std::max(0, maximum_wire_kbps - config.bitrate);
 
-    auto encoder = pyrowave::host::make_encoder(params, disp);
+    auto encoder = config.videoFormat == prores::protocol::BITSTREAM_FORMAT ?
+                     prores::host::make_encoder(params, disp) :
+                     pyrowave::host::make_encoder(params, disp);
     if (!encoder) {
-      BOOST_LOG(error) << "PyroWave: could not create the encoder for "sv << config.width << 'x' << config.height;
+      BOOST_LOG(error) << "Intra-only session: could not create the encoder for "sv << config.width << 'x' << config.height;
       return false;
     }
     // Serialize GPU device destruction with the other encoders' teardown.
@@ -6177,9 +6182,9 @@ namespace video {
         display = source_ctx.display_wp->lock();
       }
 
-      if (config.videoFormat == 3) {
+      if (pyrowave::protocol::is_intra_format(config.videoFormat)) {
         hdr_info_t hdr_info;
-        const auto colorspace = pyrowave_session_colorspace(*display, config, hdr_info);
+        const auto colorspace = pyrowave_session_colorspace(*display, config, hdr_info, config.videoFormat == 4 ? "prores"sv : "pyrowave"sv);
 
         // absolute mouse coordinates require that the dimensions of the screen are known
         touch_port_event->raise(make_port(display.get(), config));
@@ -6418,9 +6423,9 @@ namespace video {
     auto idr_events = mail->event<bool>(mail::idr);
 
     idr_events->raise(true);
-    // PyroWave sessions always run on the async path (see encode_run_pyrowave).
+    // PyroWave and ProRes sessions always run on the async path (see encode_run_pyrowave).
     if ((encoder->flags & PARALLEL_ENCODING) || config.capture_source != capture_source_e::active_output ||
-        config.videoFormat == 3) {
+        pyrowave::protocol::is_intra_format(config.videoFormat)) {
       capture_async(std::move(mail), config, channel_data);
     } else {
       safe::signal_t join_event;
@@ -6958,6 +6963,29 @@ namespace video {
     return 1;
   }
 
+  /**
+   * @brief Check whether ProRes can encode on the capture adapter.
+   *
+   * There is no config option: ProRes is only used when a client asks for it.
+   * @return The active_prores_mode for this probe: 2 when available, else 1.
+   */
+  int probe_prores(const std::optional<platf::adapter_id_t> &adapter) {
+#ifdef SUNSHINE_ENABLE_PRORES
+    const auto started = std::chrono::steady_clock::now();
+    std::string detail;
+    const bool supported = prores::host::probe(adapter, detail);
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started);
+    if (supported) {
+      BOOST_LOG(info) << "Found ProRes encoder [D3D11 compute] (probe took "sv << elapsed.count() << " ms)"sv;
+      return 2;
+    }
+    BOOST_LOG(info) << "ProRes is unavailable: "sv << detail;
+#else
+    (void) adapter;
+#endif
+    return 1;
+  }
+
   int probe_encoders() {
     std::lock_guard<std::mutex> lock(encoder_probe_mutex);
     const auto probe_target = resolve_probe_target();
@@ -7019,6 +7047,7 @@ namespace video {
     const auto previous_active_hevc_mode = active_hevc_mode;
     const auto previous_active_av1_mode = active_av1_mode;
     const auto previous_active_pyrowave_mode = active_pyrowave_mode.load();
+    const auto previous_active_prores_mode = active_prores_mode.load();
     const auto previous_last_ref_frames_invalidation = last_encoder_probe_supported_ref_frames_invalidation;
     const auto previous_last_yuv444_for_codec = last_encoder_probe_supported_yuv444_for_codec;
     auto previous_encoder = chosen_encoder;
@@ -7027,6 +7056,7 @@ namespace video {
       active_hevc_mode = previous_active_hevc_mode;
       active_av1_mode = previous_active_av1_mode;
       active_pyrowave_mode = previous_active_pyrowave_mode;
+      active_prores_mode = previous_active_prores_mode;
       last_encoder_probe_supported_ref_frames_invalidation = previous_last_ref_frames_invalidation;
       last_encoder_probe_supported_yuv444_for_codec = previous_last_yuv444_for_codec;
     });
@@ -7275,6 +7305,7 @@ namespace video {
 
     // PyroWave does not use the selected encoder, only the capture adapter it validated on.
     active_pyrowave_mode = probe_pyrowave(successful_probe_adapter ? successful_probe_adapter : required_adapter);
+    active_prores_mode = probe_prores(successful_probe_adapter ? successful_probe_adapter : required_adapter);
 
     const bool hevc_passed = encoder.hevc[encoder_t::PASSED];
     const bool hevc_hdr_supported = encoder.hevc[encoder_t::DYNAMIC_RANGE];
@@ -7328,6 +7359,7 @@ namespace video {
       .hevc_mode = active_hevc_mode,
       .av1_mode = active_av1_mode,
       .pyrowave_mode = active_pyrowave_mode.load(),
+      .prores_mode = active_prores_mode.load(),
       .yuv444_for_codec = last_encoder_probe_supported_yuv444_for_codec,
     };
     update_probe_cache(
