@@ -9,6 +9,8 @@
 #include "prores_d3d11_core.h"
 
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -37,6 +39,20 @@ namespace prores::d3d11 {
     };
 
     static_assert(sizeof(dct_params_t) % 16 == 0, "Constant buffers are sized in 16-byte units");
+
+    // Matches prores_params (b0) in prores_common.hlsl.
+    struct coder_params_t {
+      std::uint32_t slices;
+      std::uint32_t budget_bytes;
+      std::uint32_t capacity_bytes;
+      std::uint32_t chroma_blocks;
+      std::uint32_t log2_mbs;
+      std::uint32_t padding[3];
+      std::uint32_t ladder[16];
+      std::uint32_t qmat[128];  ///< luma then chroma, one uint per byte
+    };
+
+    static_assert(sizeof(coder_params_t) % 16 == 0, "Constant buffers are sized in 16-byte units");
 
     // Matches sdr_to_pq_params_cbuffer (b1) in include/convert_sdr_to_pq_base.hlsl.
     struct sdr_to_pq_params_t {
@@ -67,6 +83,18 @@ namespace prores::d3d11 {
     ComPtr<ID3D11Buffer> sdr_to_pq_params;
     ComPtr<ID3D11Buffer> params;
     ComPtr<ID3D11SamplerState> sampler;
+    ComPtr<ID3D11UnorderedAccessView> counts_uav;
+    ComPtr<ID3D11UnorderedAccessView> plan_uav;
+    ComPtr<ID3D11UnorderedAccessView> out_uav;
+    ComPtr<ID3D11Buffer> out_buffer;
+    ComPtr<ID3D11Buffer> staging;
+    ComPtr<ID3D11Buffer> slice_info;
+    ComPtr<ID3D11ShaderResourceView> slice_info_srv;
+    ComPtr<ID3D11Buffer> coder_params;
+    ComPtr<ID3D11ComputeShader> count_shader, choose_shader, write_shader;
+    std::size_t frame_prefix = 0;  ///< frame atom + frame header
+    std::size_t capacity_picture = 0;
+    std::uint32_t out_bytes = 0;
     std::map<transfer_e, ComPtr<ID3D11ComputeShader>> dct_shaders;
     dct_params_t last_params {};
     bool params_valid = false;
@@ -157,6 +185,77 @@ namespace prores::d3d11 {
         error("macroblock table view creation failed [" + hresult_string(hr) + "]");
         return false;
       }
+
+      // Count, choose and write passes.
+      const std::size_t slices = layout.slices.size();
+      frame_prefix = 8 + (config.quant.send ? 148 : 20);
+      const std::size_t capacity_frame = std::max(config.capacity_frame_bytes, layout.critical_bytes() + 1024);
+      capacity_picture = capacity_frame - frame_prefix;
+      out_bytes = UINT((16 + capacity_picture + 3) & ~std::size_t(3));
+      auto raw_buffer = [&](UINT bytes, ComPtr<ID3D11Buffer> &buffer, ComPtr<ID3D11UnorderedAccessView> &view, const char *what) {
+        D3D11_BUFFER_DESC rd {};
+        rd.ByteWidth = bytes;
+        rd.Usage = D3D11_USAGE_DEFAULT;
+        rd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        rd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        HRESULT result = device->CreateBuffer(&rd, nullptr, &buffer);
+        if (SUCCEEDED(result)) {
+          D3D11_UNORDERED_ACCESS_VIEW_DESC rv {};
+          rv.Format = DXGI_FORMAT_R32_TYPELESS;
+          rv.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+          rv.Buffer.NumElements = bytes / 4;
+          rv.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+          result = device->CreateUnorderedAccessView(buffer.Get(), &rv, &view);
+        }
+        if (FAILED(result)) {
+          error(std::string(what) + " buffer creation failed [" + hresult_string(result) + "]");
+          return false;
+        }
+        return true;
+      };
+      ComPtr<ID3D11Buffer> counts, plan;
+      if (!raw_buffer(UINT(16 * slices * 3 * 4), counts, counts_uav, "count") || !raw_buffer(UINT((slices + 1) * 16), plan, plan_uav, "plan") ||
+          !raw_buffer(out_bytes, out_buffer, out_uav, "output")) {
+        return false;
+      }
+      bd = {};
+      bd.ByteWidth = out_bytes;
+      bd.Usage = D3D11_USAGE_STAGING;
+      bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      hr = device->CreateBuffer(&bd, nullptr, &staging);
+      if (FAILED(hr)) {
+        error("readback buffer creation failed [" + hresult_string(hr) + "]");
+        return false;
+      }
+
+      // Per slice: mbs, coefficient offsets of the three planes.
+      std::vector<std::uint32_t> slice_data(slices * 4);
+      for (std::size_t i = 0; i < slices; i++) {
+        const auto &slice = layout.slices[i];
+        slice_data[i * 4] = slice.mbs;
+        for (int p = 0; p < 3; p++) {
+          slice_data[i * 4 + 1 + p] = slice.coeff_offset[p];
+        }
+      }
+      bd = {};
+      bd.ByteWidth = UINT(slice_data.size() * sizeof(std::uint32_t));
+      bd.Usage = D3D11_USAGE_IMMUTABLE;
+      bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+      bd.StructureByteStride = 16;
+      init = {slice_data.data(), 0, 0};
+      hr = device->CreateBuffer(&bd, &init, &slice_info);
+      if (SUCCEEDED(hr)) {
+        sd = {};
+        sd.Format = DXGI_FORMAT_UNKNOWN;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        sd.Buffer.NumElements = UINT(slices);
+        hr = device->CreateShaderResourceView(slice_info.Get(), &sd, &slice_info_srv);
+      }
+      if (FAILED(hr)) {
+        error("slice table creation failed [" + hresult_string(hr) + "]");
+        return false;
+      }
       return true;
     }
 
@@ -186,6 +285,14 @@ namespace prores::d3d11 {
       hr = device->CreateBuffer(&cb, nullptr, &params);
       if (FAILED(hr)) {
         error("parameter buffer creation failed [" + hresult_string(hr) + "]");
+        return false;
+      }
+
+      cb.ByteWidth = sizeof(coder_params_t);
+      cb.Usage = D3D11_USAGE_DEFAULT;
+      hr = device->CreateBuffer(&cb, nullptr, &coder_params);
+      if (FAILED(hr)) {
+        error("coder parameter buffer creation failed [" + hresult_string(hr) + "]");
         return false;
       }
 
@@ -227,22 +334,34 @@ namespace prores::d3d11 {
       }
       macros.push_back({nullptr, nullptr});
 
-      const std::wstring path = config.shader_dir + L"/prores_dct_cs.hlsl";
+      shader = compile("prores_dct_cs.hlsl", macros.data());
+      return shader.Get();
+    }
+
+    ComPtr<ID3D11ComputeShader> compile(const char *file, const D3D_SHADER_MACRO *macros) {
+      const std::wstring path = config.shader_dir + L"/" + std::wstring(file, file + std::strlen(file));
       ComPtr<ID3DBlob> code;
       ComPtr<ID3DBlob> messages;
-      HRESULT hr = D3DCompileFromFile(path.c_str(), macros.data(), D3D_COMPILE_STANDARD_FILE_INCLUDE, "main_cs", "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &messages);
+      HRESULT hr = D3DCompileFromFile(path.c_str(), macros, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main_cs", "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &messages);
       if (FAILED(hr)) {
         std::string detail = messages ? std::string(static_cast<const char *>(messages->GetBufferPointer()), messages->GetBufferSize()) : std::string("no compiler output");
-        error("compiling prores_dct_cs.hlsl failed [" + hresult_string(hr) + "]: " + detail);
+        error(std::string("compiling ") + file + " failed [" + hresult_string(hr) + "]: " + detail);
         return nullptr;
       }
+      ComPtr<ID3D11ComputeShader> shader;
       hr = device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader);
       if (FAILED(hr)) {
-        error("CreateComputeShader failed [" + hresult_string(hr) + "]");
-        shader.Reset();
+        error(std::string("CreateComputeShader failed for ") + file + " [" + hresult_string(hr) + "]");
         return nullptr;
       }
-      return shader.Get();
+      return shader;
+    }
+
+    bool compile_coder_shaders() {
+      count_shader = compile("prores_count_cs.hlsl", nullptr);
+      choose_shader = compile("prores_choose_cs.hlsl", nullptr);
+      write_shader = compile("prores_write_cs.hlsl", nullptr);
+      return count_shader && choose_shader && write_shader;
     }
 
     void update_params(const pyrowave::d3d11::source_t *source) {
@@ -328,6 +447,109 @@ namespace prores::d3d11 {
       }
       return result_e::ok;
     }
+
+    // Count, choose and write passes, then the single blocking readback. Returns the picture
+    // bytes (0: the frame does not fit the capacity) in `picture` and the chosen q.
+    result_e run_coder(std::size_t max_frame_bytes, std::vector<std::uint8_t> &out, std::size_t &picture, int &q) {
+      const std::size_t slices = layout.slices.size();
+      const std::size_t budget = max_frame_bytes > frame_prefix ? max_frame_bytes - frame_prefix : 0;
+
+      coder_params_t cp {};
+      cp.slices = std::uint32_t(slices);
+      cp.budget_bytes = std::uint32_t(std::min<std::size_t>(budget, 0xFFFFFFFFu));
+      cp.capacity_bytes = std::uint32_t(capacity_picture);
+      cp.chroma_blocks = config.yuv444 ? 4 : 2;
+      cp.log2_mbs = std::uint32_t(std::countr_zero(unsigned(layout.mbs_per_slice)));
+      for (int i = 0; i < 16; i++) {
+        cp.ladder[i] = std::uint32_t(config.ladder[i]);
+      }
+      for (int i = 0; i < 64; i++) {
+        cp.qmat[i] = config.quant.luma[i];
+        cp.qmat[64 + i] = config.quant.chroma[i];
+      }
+      context->UpdateSubresource(coder_params.Get(), 0, nullptr, &cp, 0, 0);
+
+      const UINT zero[4] = {};
+      context->ClearUnorderedAccessViewUint(out_uav.Get(), zero);
+
+      ID3D11Buffer *cbs[] = {coder_params.Get()};
+      ID3D11ShaderResourceView *srvs[] = {slice_info_srv.Get()};
+      ID3D11UnorderedAccessView *uavs[] = {coeffs_uav.Get(), counts_uav.Get(), plan_uav.Get(), out_uav.Get()};
+      context->CSSetConstantBuffers(0, 1, cbs);
+      context->CSSetShaderResources(0, 1, srvs);
+      context->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+      const UINT groups = UINT((slices + 63) / 64);
+      context->CSSetShader(count_shader.Get(), nullptr, 0);
+      context->Dispatch(groups, 3, 16);
+      context->CSSetShader(choose_shader.Get(), nullptr, 0);
+      context->Dispatch(1, 1, 1);
+      context->CSSetShader(write_shader.Get(), nullptr, 0);
+      context->Dispatch(groups, 3, 1);
+
+      ID3D11ShaderResourceView *null_srvs[1] = {};
+      ID3D11UnorderedAccessView *null_uavs[4] = {};
+      context->CSSetShaderResources(0, 1, null_srvs);
+      context->CSSetUnorderedAccessViews(0, 4, null_uavs, nullptr);
+
+      auto read_back = [&](std::size_t bytes, D3D11_MAPPED_SUBRESOURCE &mapped) {
+        bytes = std::min<std::size_t>((bytes + 3) & ~std::size_t(3), out_bytes);
+        const D3D11_BOX box {0, 0, 0, UINT(bytes), 1, 1};
+        context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, out_buffer.Get(), 0, &box);
+        const HRESULT hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) {
+          error("mapping the picture failed [" + hresult_string(hr) + "]");
+          return false;
+        }
+        return true;
+      };
+
+      const std::size_t bound = 16 + std::min(budget, capacity_picture);
+      D3D11_MAPPED_SUBRESOURCE mapped {};
+      if (!read_back(bound, mapped)) {
+        return result_e::failed;
+      }
+      std::uint32_t result[4];
+      std::memcpy(result, mapped.pData, sizeof(result));
+      picture = result[0];
+      q = int(result[1]);
+      if (picture != 0 && 16 + picture > bound) {
+        // Only the coarsest q was left and it exceeds the budget: fetch the rest.
+        context->Unmap(staging.Get(), 0);
+        if (!read_back(16 + picture, mapped)) {
+          return result_e::failed;
+        }
+      }
+      if (picture != 0) {
+        const std::size_t total = frame_prefix + picture;
+        out.resize(total);
+        std::uint8_t *f = out.data();
+        std::memset(f, 0, frame_prefix);
+        auto put16 = [](std::uint8_t *d, unsigned v) {
+          d[0] = std::uint8_t(v >> 8);
+          d[1] = std::uint8_t(v);
+        };
+        put16(f, unsigned(total >> 16));
+        put16(f + 2, unsigned(total & 0xFFFF));
+        std::memcpy(f + 4, "icpf", 4);
+        put16(f + 8, unsigned(frame_prefix - 8));
+        put16(f + 10, config.yuv444 ? 1 : 0);
+        std::memcpy(f + 12, "cfrm", 4);
+        put16(f + 16, unsigned(config.width));
+        put16(f + 18, unsigned(config.height));
+        f[20] = config.yuv444 ? 0xC0 : 0x80;
+        f[22] = config.color.primaries;
+        f[23] = config.color.transfer;
+        f[24] = config.color.matrix;
+        f[27] = config.quant.send ? 0x03 : 0;
+        if (config.quant.send) {
+          std::memcpy(f + 28, config.quant.luma, 64);
+          std::memcpy(f + 92, config.quant.chroma, 64);
+        }
+        std::memcpy(f + frame_prefix, static_cast<const std::uint8_t *>(mapped.pData) + 16, picture);
+      }
+      context->Unmap(staging.Get(), 0);
+      return result_e::ok;
+    }
   };
 
   core_t::core_t() = default;
@@ -352,7 +574,7 @@ namespace prores::d3d11 {
 
     // Compile the common SDR variant up front so a shader error ends session setup
     // instead of the first streamed frame.
-    if (!impl.dct_shader_for(transfer_e::unorm)) {
+    if (!impl.dct_shader_for(transfer_e::unorm) || !impl.compile_coder_shaders()) {
       return nullptr;
     }
     return core;
@@ -373,14 +595,33 @@ namespace prores::d3d11 {
     std::size_t &critical_bytes,
     frame_stats_t *stats
   ) {
-    (void) max_frame_bytes;
     out.clear();
     critical_bytes = 0;
     if (stats) {
       *stats = {};
     }
-    const result_e result = impl->run_dct(source);
-    return result == result_e::ok ? result_e::skipped : result;
+    const auto start = std::chrono::steady_clock::now();
+    result_e result = impl->run_dct(source);
+    if (result != result_e::ok) {
+      return result;
+    }
+    std::size_t picture = 0;
+    int q = 0;
+    result = impl->run_coder(max_frame_bytes, out, picture, q);
+    if (result != result_e::ok) {
+      return result;
+    }
+    if (picture == 0) {
+      impl->warning("the frame does not fit the output capacity at the coarsest q; skipping it");
+      return result_e::skipped;
+    }
+    critical_bytes = impl->frame_prefix + 8 + 2 * impl->layout.slices.size();
+    if (stats) {
+      stats->gpu_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      stats->frame_bytes = out.size();
+      stats->q = q;
+    }
+    return result_e::ok;
   }
 
   bool core_t::read_coefficients(std::vector<std::int16_t> &coeffs) {

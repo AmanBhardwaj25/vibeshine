@@ -2,13 +2,19 @@
  * @file tools/prores/prores_gpu_test.cpp
  * @brief Windows: compares the GPU core's coefficients with the CPU reference (WARP or a real GPU).
  *
- * usage: prores_gpu_test <shader dir>
+ * usage: prores_gpu_test <shader dir> [output dir]
+ *
+ * Per case: the GPU coefficients are compared with forward_dct (tolerance, see below), then whole frames
+ * from the GPU are compared byte for byte with the CPU reference coded from those same coefficients.
+ * At 3024x1890 it also times the encoder and writes 30 frames per chroma mode plus the reference
+ * samples (prores_gpu_*.bin, *_ref.yuv, *.txt) into the output dir.
  */
 #include "src/platform/windows/prores_d3d11_core.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -97,7 +103,7 @@ namespace {
     std::printf("[%d] %s\n", level, message.c_str());
   }
 
-  bool run_case(IDXGIAdapter *adapter, const std::wstring &shader_dir, int w, int h, bool yuv444) {
+  bool run_case(IDXGIAdapter *adapter, const std::wstring &shader_dir, const std::string &out_dir, int w, int h, bool yuv444) {
     std::printf("case %dx%d %s\n", w, h, yuv444 ? "4:4:4" : "4:2:2");
     prores::d3d11::core_config_t config;
     config.width = w;
@@ -142,7 +148,7 @@ namespace {
     source.height = UINT(h);
     std::vector<std::uint8_t> out;
     std::size_t critical = 0;
-    CHECK(core->encode(source, 1 << 20, out, critical) == prores::d3d11::result_e::skipped);
+    CHECK(core->encode(source, 1 << 20, out, critical) == prores::d3d11::result_e::ok);
     std::vector<std::int16_t> gpu;
     CHECK(core->read_coefficients(gpu));
 
@@ -209,17 +215,104 @@ namespace {
     CHECK(max_diff <= 4);
     CHECK(double(bad) <= 1e-5 * double(cpu.size()));
     CHECK(exact_pct >= 98.0);
+
+    // Entropy coding: the GPU frame must equal the CPU reference coded from the GPU's own coefficients.
+    auto bytes_at = [](double mbps) { return std::size_t(mbps * 1e6 / 8 / 60); };
+    const auto &ladder = config.ladder;
+    std::vector<std::size_t> budgets = {bytes_at(150), bytes_at(290), bytes_at(600), 1000};
+    for (int k : {3, 9, 15}) {
+      const std::size_t exact_size = prores::frame_bytes(layout, gpu.data(), ladder[k], config.quant);
+      budgets.push_back(exact_size);
+      budgets.push_back(exact_size - 1);
+    }
+    std::vector<std::uint8_t> ref;
+    for (std::size_t budget : budgets) {
+      prores::d3d11::frame_stats_t stats;
+      CHECK(core->encode(source, budget, out, critical, &stats) == prores::d3d11::result_e::ok);
+      const int idx = prores::choose_ladder_index(layout, gpu.data(), budget, ladder, config.quant);
+      prores::write_frame(layout, gpu.data(), ladder[idx], config.color, config.quant, ref);
+      const bool same = out == ref;
+      std::printf("  budget %zu: q %d (index %d), %zu bytes%s\n", budget, stats.q, idx, out.size(), same ? "" : " MISMATCH");
+      if (!same) {
+        std::size_t i = 0;
+        while (i < std::min(out.size(), ref.size()) && out[i] == ref[i]) {
+          i++;
+        }
+        std::printf("    gpu %zu bytes, cpu %zu bytes, first difference at byte %zu\n", out.size(), ref.size(), i);
+      }
+      CHECK(same);
+      CHECK(critical == layout.critical_bytes());
+      CHECK(stats.q == ladder[idx]);
+      CHECK(stats.frame_bytes == out.size());
+      if (idx != 15) {
+        CHECK(out.size() <= budget);
+      }
+    }
+    // The tight budgets above must have reached the coarsest and a middle q, otherwise the test says little.
+    if (w * h >= 1920 * 1080) {
+      std::printf("  chosen q for 150/290/600 Mbps at 60 fps: ");
+      for (int i = 0; i < 3; i++) {
+        prores::d3d11::frame_stats_t stats;
+        CHECK(core->encode(source, budgets[i], out, critical, &stats) == prores::d3d11::result_e::ok);
+        std::printf("%d (%zu bytes)%s", stats.q, out.size(), i < 2 ? ", " : "\n");
+      }
+    }
+
+    if (w < 3000) {
+      return true;
+    }
+
+    // Timing at 290 Mbps (WARP numbers are not representative; stops after 120 frames or 20 s).
+    {
+      std::vector<double> ms;
+      const auto begin = std::chrono::steady_clock::now();
+      while (ms.size() < 120 && std::chrono::steady_clock::now() - begin < std::chrono::seconds(20)) {
+        prores::d3d11::frame_stats_t stats;
+        CHECK(core->encode(source, budgets[1], out, critical, &stats) == prores::d3d11::result_e::ok);
+        ms.push_back(stats.gpu_wait_ms);
+      }
+      std::sort(ms.begin(), ms.end());
+      std::printf("  encode time over %zu frames: median %.2f ms, p95 %.2f ms, max %.2f ms\n", ms.size(), ms[ms.size() / 2], ms[std::size_t(double(ms.size() - 1) * 0.95)], ms.back());
+    }
+
+    // Artifacts for the Mac-side decode check: 30 frames with budgets from 100 to 700 Mbps.
+    {
+      const std::string base = out_dir + (yuv444 ? "/prores_gpu_444" : "/prores_gpu_422");
+      FILE *bin = std::fopen((base + ".bin").c_str(), "wb");
+      FILE *txt = std::fopen((base + ".txt").c_str(), "w");
+      FILE *yuv = std::fopen((base + "_ref.yuv").c_str(), "wb");
+      CHECK(bin && txt && yuv);
+      if (bin && txt && yuv) {
+        for (int f = 0; f < 30; f++) {
+          prores::d3d11::frame_stats_t stats;
+          const std::size_t budget = bytes_at(100.0 + 600.0 * f / 29.0);
+          CHECK(core->encode(source, budget, out, critical, &stats) == prores::d3d11::result_e::ok);
+          std::fwrite(out.data(), 1, out.size(), bin);
+          std::fprintf(txt, "%d %zu %d %zu\n", f, budget, stats.q, out.size());
+        }
+        for (const auto *plane : planes) {
+          const std::size_t n = plane == planes[0] ? py.size() : pcb.size();
+          std::fwrite(plane, 2, n, yuv);
+        }
+      }
+      for (FILE *file : {bin, txt, yuv}) {
+        if (file) {
+          std::fclose(file);
+        }
+      }
+    }
     return true;
   }
 }  // namespace
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    std::printf("usage: prores_gpu_test <shader dir>\n");
+    std::printf("usage: prores_gpu_test <shader dir> [output dir]\n");
     return 2;
   }
   const std::string dir = argv[1];
   const std::wstring shader_dir(dir.begin(), dir.end());
+  const std::string out_dir = argc > 2 ? argv[2] : ".";
 
   ComPtr<IDXGIFactory4> factory;
   if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
@@ -257,7 +350,7 @@ int main(int argc, char **argv) {
   const int sizes[][2] = {{64, 64}, {17, 9}, {1920, 1080}, {3024, 1890}};
   for (const auto &s : sizes) {
     for (bool yuv444 : {false, true}) {
-      run_case(adapter.Get(), shader_dir, s[0], s[1], yuv444);
+      run_case(adapter.Get(), shader_dir, out_dir, s[0], s[1], yuv444);
     }
   }
   std::printf(failures ? "FAILED (%d)\n" : "PASS\n", failures);

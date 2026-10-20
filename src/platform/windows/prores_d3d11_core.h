@@ -7,7 +7,10 @@
  *   captured frame (D3D11 texture, keyed mutex)
  *     -> private D3D11 device on the capture adapter
  *     -> prores_dct_cs: RGB -> 10-bit Y'CbCr, 8x8 DCT, coefficients in slice scan order
- *     -> (later steps) count, choose and write passes, one readback
+ *     -> prores_count_cs: exact bytes per (candidate q, slice, plane)
+ *     -> prores_choose_cs: finest q within the byte budget, slice offsets, headers
+ *     -> prores_write_cs: bit-exact slice data
+ *     -> one blocking readback
  *
  * This file has no Sunshine dependencies so it can be driven by a standalone test
  * harness. It only borrows the colour types of the PyroWave D3D11 core.
@@ -40,6 +43,7 @@ namespace prores::d3d11 {
     std::wstring shader_dir;  ///< Directory holding the prores_*.hlsl files.
     float sdr_white_nits = 100.0f;  ///< For transfer_e::sdr_to_pq.
     std::chrono::milliseconds capture_wait {};  ///< Negotiated frame interval, rounded up.
+    std::size_t capacity_frame_bytes = 8u << 20;  ///< Largest frame the output buffer holds (the transport limit).
     std::array<int, 16> ladder = prores::default_ladder;
     prores::quant_t quant;
   };
@@ -75,7 +79,9 @@ namespace prores::d3d11 {
     /**
      * @brief Convert and encode one frame into `out` (frame atom, frame header, picture).
      *
-     * P3a: only the DCT pass runs and the result is always `skipped`.
+     * `max_frame_bytes` is the byte budget of the whole frame. `critical_bytes` receives the
+     * frame atom, frame header, picture header and slice table. `skipped` also covers a frame
+     * that does not fit `capacity_frame_bytes` at the coarsest q.
      */
     result_e encode(
       const pyrowave::d3d11::source_t &source,

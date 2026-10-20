@@ -41,10 +41,10 @@ jobs:
       - name: Run tests
         shell: msys2 {0}
         run: |
-          mkdir -p logs
+          mkdir -p logs artifacts
           set -o pipefail
           ./build-prores/prores_selftest 2>&1 | tee logs/selftest.log
-          ./build-prores/prores_gpu_test src_assets/windows/assets/shaders/directx 2>&1 | tee logs/gpu_test.log
+          ./build-prores/prores_gpu_test src_assets/windows/assets/shaders/directx artifacts 2>&1 | tee logs/gpu_test.log
 
       - name: Upload test logs
         if: always()
@@ -52,3 +52,10 @@ jobs:
         with:
           name: prores-tools-logs
           path: logs
+
+      - name: Upload GPU frames
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: prores-gpu-frames
+          path: artifacts
