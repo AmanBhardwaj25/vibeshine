@@ -141,6 +141,12 @@ int coeff_at(uint idx) {
     return ((int) ((idx & 1) ? (w & 0xFFFF0000) : (w << 16))) >> 16;
 }
 
+// Division truncating toward zero, spelled out on magnitudes.
+int quantize(int v, int d) {
+    const int a = abs(v) / d;
+    return v < 0 ? -a : a;
+}
+
 uint make_code(int x) {
     return (uint) ((x * 2) ^ (x >> 31));
 }
@@ -149,12 +155,12 @@ uint make_code(int x) {
 // blocks in the slice plane.
 void code_plane(inout sink_t s, uint base, uint blocks, uint plane, uint q) {
     const int scale = (int) (quant_at(plane, 0) * q);
-    int prev = (coeff_at(base) - 0x4000) / scale;
+    int prev = quantize(coeff_at(base) - 0x4000, scale);
     codeword(s, 0xB8, make_code(prev));
     int sign = 0;
     uint cbi = 5;
     for (uint b = 1; b < blocks; b++) {
-        const int dc = (coeff_at(base + b) - 0x4000) / scale;
+        const int dc = quantize(coeff_at(base + b) - 0x4000, scale);
         int d = dc - prev;
         const int ns = d >> 31;
         d = (d ^ sign) - sign;
@@ -169,7 +175,7 @@ void code_plane(inout sink_t s, uint base, uint blocks, uint plane, uint q) {
         const int div = (int) (quant_at(plane, scan[p]) * q);
         const uint row = base + p * blocks;
         for (uint b = 0; b < blocks; b++) {
-            const int level = coeff_at(row + b) / div;
+            const int level = quantize(coeff_at(row + b), div);
             [branch] if (level != 0) {
                 const uint al = (uint) abs(level);
                 codeword(s, run_cb[prev_run], run);
