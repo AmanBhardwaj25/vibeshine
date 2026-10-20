@@ -55,16 +55,16 @@ uint bswap(uint x) {
 // little-endian memory order (bswap of the MSB-first word); bytes that are not part of the
 // stream must be zero. Neighbouring writers never share a nonzero byte.
 void store_word_be(uint pos, uint be) {
-    if (be == 0) {
+    [branch] if (be == 0) {
         return;
     }
     const uint w = pos & ~3u;
     const uint s = (pos & 3) * 8;
     uint old;
     out_buf.InterlockedOr(w, be << s, old);
-    if (s != 0) {
+    [branch] if (s != 0) {
         const uint hi = be >> (32 - s);
-        if (hi != 0) {
+        [branch] if (hi != 0) {
             out_buf.InterlockedOr(w + 4, hi, old);
         }
     }
@@ -80,15 +80,15 @@ struct sink_t {
 };
 
 void put(inout sink_t s, uint n, uint val) {
-    if (n == 0) {
+    [branch] if (n == 0) {
         return;
     }
 #ifdef WRITE
-    if (n < 32) {
+    [branch] if (n < 32) {
         val &= (1u << n) - 1;
     }
     const uint space = 32 - s.nacc;
-    if (n < space) {
+    [branch] if (n < space) {
         s.acc = (s.acc << n) | val;
         s.nacc += n;
     } else {
@@ -107,7 +107,7 @@ void put(inout sink_t s, uint n, uint val) {
 // Pads the plane to a byte boundary with zero bits.
 void flush(inout sink_t s) {
 #ifdef WRITE
-    if (s.nacc) {
+    [branch] if (s.nacc) {
         store_word_be(s.pos, bswap(s.acc << (32 - s.nacc)));
         s.pos += (s.nacc + 7) >> 3;
         s.acc = 0;
@@ -121,7 +121,7 @@ void codeword(inout sink_t s, uint cb, uint val) {
     const uint rice = cb >> 5;
     const uint expo = (cb >> 2) & 7;
     const uint switch_val = switch_bits << rice;
-    if (val >= switch_val) {
+    [branch] if (val >= switch_val) {
         val -= switch_val - (1u << expo);
         const uint e = firstbithigh(val);
         put(s, e - expo + switch_bits, 0);
@@ -130,7 +130,7 @@ void codeword(inout sink_t s, uint cb, uint val) {
         const uint e = val >> rice;
         put(s, e, 0);
         put(s, 1, 1);
-        if (rice) {
+        [branch] if (rice) {
             put(s, rice, val);
         }
     }
@@ -170,7 +170,7 @@ void code_plane(inout sink_t s, uint base, uint blocks, uint plane, uint q) {
         const uint row = base + p * blocks;
         for (uint b = 0; b < blocks; b++) {
             const int level = coeff_at(row + b) / div;
-            if (level != 0) {
+            [branch] if (level != 0) {
                 const uint al = (uint) abs(level);
                 codeword(s, run_cb[prev_run], run);
                 codeword(s, level_cb[prev_level], al - 1);
