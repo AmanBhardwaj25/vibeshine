@@ -83,6 +83,7 @@ namespace prores::d3d11 {
     ComPtr<ID3D11Buffer> sdr_to_pq_params;
     ComPtr<ID3D11Buffer> params;
     ComPtr<ID3D11SamplerState> sampler;
+    ComPtr<ID3D11Buffer> counts;
     ComPtr<ID3D11UnorderedAccessView> counts_uav;
     ComPtr<ID3D11UnorderedAccessView> plan_uav;
     ComPtr<ID3D11UnorderedAccessView> out_uav;
@@ -213,7 +214,7 @@ namespace prores::d3d11 {
         }
         return true;
       };
-      ComPtr<ID3D11Buffer> counts, plan;
+      ComPtr<ID3D11Buffer> plan;
       if (!raw_buffer(UINT(16 * slices * 3 * 4), counts, counts_uav, "count") || !raw_buffer(UINT((slices + 1) * 16), plan, plan_uav, "plan") ||
           !raw_buffer(out_bytes, out_buffer, out_uav, "output")) {
         return false;
@@ -624,29 +625,46 @@ namespace prores::d3d11 {
     return result_e::ok;
   }
 
+  namespace {
+    bool read_buffer(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Buffer *buffer, std::size_t bytes, void *dst) {
+      D3D11_BUFFER_DESC bd {};
+      buffer->GetDesc(&bd);
+      bd.Usage = D3D11_USAGE_STAGING;
+      bd.BindFlags = 0;
+      bd.MiscFlags = 0;
+      bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      ComPtr<ID3D11Buffer> staging;
+      if (FAILED(device->CreateBuffer(&bd, nullptr, &staging))) {
+        return false;
+      }
+      context->CopyResource(staging.Get(), buffer);
+      D3D11_MAPPED_SUBRESOURCE mapped {};
+      if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        return false;
+      }
+      std::memcpy(dst, mapped.pData, bytes);
+      context->Unmap(staging.Get(), 0);
+      return true;
+    }
+  }  // namespace
+
   bool core_t::read_coefficients(std::vector<std::int16_t> &coeffs) {
     auto &state = *impl;
-    D3D11_BUFFER_DESC bd {};
-    state.coeffs->GetDesc(&bd);
-    bd.Usage = D3D11_USAGE_STAGING;
-    bd.BindFlags = 0;
-    bd.MiscFlags = 0;
-    bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    ComPtr<ID3D11Buffer> staging;
-    if (FAILED(state.device->CreateBuffer(&bd, nullptr, &staging))) {
-      state.error("staging buffer creation failed");
-      return false;
-    }
-    state.context->CopyResource(staging.Get(), state.coeffs.Get());
-    D3D11_MAPPED_SUBRESOURCE mapped {};
-    const HRESULT hr = state.context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) {
-      state.error("mapping the coefficients failed [" + hresult_string(hr) + "]");
-      return false;
-    }
     coeffs.resize(state.layout.total_coeffs);
-    std::memcpy(coeffs.data(), mapped.pData, coeffs.size() * sizeof(std::int16_t));
-    state.context->Unmap(staging.Get(), 0);
+    if (!read_buffer(state.device.Get(), state.context.Get(), state.coeffs.Get(), coeffs.size() * sizeof(std::int16_t), coeffs.data())) {
+      state.error("reading the coefficients back failed");
+      return false;
+    }
+    return true;
+  }
+
+  bool core_t::read_counts(std::vector<std::uint32_t> &counts) {
+    auto &state = *impl;
+    counts.resize(16 * state.layout.slices.size() * 3);
+    if (!read_buffer(state.device.Get(), state.context.Get(), state.counts.Get(), counts.size() * sizeof(std::uint32_t), counts.data())) {
+      state.error("reading the counts back failed");
+      return false;
+    }
     return true;
   }
 

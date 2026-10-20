@@ -216,14 +216,33 @@ namespace {
     CHECK(double(bad) <= 1e-5 * double(cpu.size()));
     CHECK(exact_pct >= 98.0);
 
+    const auto &ladder = config.ladder;
     // Entropy coding: the GPU frame must equal the CPU reference coded from the GPU's own coefficients.
     auto bytes_at = [](double mbps) { return std::size_t(mbps * 1e6 / 8 / 60); };
-    const auto &ladder = config.ladder;
     std::vector<std::size_t> budgets = {bytes_at(150), bytes_at(290), bytes_at(600), 1000};
     for (int k : {3, 9, 15}) {
       const std::size_t exact_size = prores::frame_bytes(layout, gpu.data(), ladder[k], config.quant);
       budgets.push_back(exact_size);
       budgets.push_back(exact_size - 1);
+    }
+    {
+      // Count pass against the CPU coder, per candidate, slice and plane.
+      std::vector<std::uint32_t> counts;
+      CHECK(core->read_counts(counts));
+      std::size_t wrong = 0;
+      for (int c = 0; c < 16 && counts.size() == 16 * layout.slices.size() * 3; c++) {
+        for (std::size_t i = 0; i < layout.slices.size(); i++) {
+          for (int p = 0; p < 3; p++) {
+            const std::size_t want = prores::plane_bytes(layout, gpu.data(), i, p, ladder[c], config.quant);
+            const std::size_t got = counts[(c * layout.slices.size() + i) * 3 + p];
+            if (want != got && wrong++ < 6) {
+              std::printf("  count mismatch c %d slice %zu plane %d: gpu %zu cpu %zu\n", c, i, p, got, want);
+            }
+          }
+        }
+      }
+      std::printf("  count pass mismatches: %zu\n", wrong);
+      CHECK(wrong == 0);
     }
     std::vector<std::uint8_t> ref;
     for (std::size_t budget : budgets) {

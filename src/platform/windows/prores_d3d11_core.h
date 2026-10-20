@@ -94,6 +94,9 @@ namespace prores::d3d11 {
     /// Test hook: wait for the GPU and copy the coefficient buffer back (layout().total_coeffs values).
     bool read_coefficients(std::vector<std::int16_t> &coeffs);
 
+    /// Test hook: bytes per (candidate, slice, plane) of the last frame, index (c * slices + slice) * 3 + plane.
+    bool read_counts(std::vector<std::uint32_t> &counts);
+
   private:
     friend bool probe(const LUID *, const std::wstring &, std::string &);
     core_t();
