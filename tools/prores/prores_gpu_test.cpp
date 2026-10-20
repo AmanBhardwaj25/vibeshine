@@ -112,6 +112,7 @@ namespace {
     config.color_matrix = bt709_limited();
     config.shader_dir = shader_dir;
     config.capture_wait = std::chrono::milliseconds(100);
+    config.capacity_frame_bytes = 16u << 20;
     auto core = prores::d3d11::core_t::create(adapter, config, log_to_stdout);
     if (!core) {
       std::printf("FAIL core creation\n");

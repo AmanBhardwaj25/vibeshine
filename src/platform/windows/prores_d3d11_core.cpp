@@ -453,7 +453,7 @@ namespace prores::d3d11 {
     // bytes (0: the frame does not fit the capacity) in `picture` and the chosen q.
     result_e run_coder(std::size_t max_frame_bytes, std::vector<std::uint8_t> &out, std::size_t &picture, int &q) {
       const std::size_t slices = layout.slices.size();
-      const std::size_t budget = max_frame_bytes > frame_prefix ? max_frame_bytes - frame_prefix : 0;
+      const std::size_t budget = std::min(max_frame_bytes > frame_prefix ? max_frame_bytes - frame_prefix : 0, capacity_picture);
 
       coder_params_t cp {};
       cp.slices = std::uint32_t(slices);
@@ -504,7 +504,7 @@ namespace prores::d3d11 {
         return true;
       };
 
-      const std::size_t bound = 16 + std::min(budget, capacity_picture);
+      const std::size_t bound = 16 + budget;
       D3D11_MAPPED_SUBRESOURCE mapped {};
       if (!read_back(bound, mapped)) {
         return result_e::failed;
