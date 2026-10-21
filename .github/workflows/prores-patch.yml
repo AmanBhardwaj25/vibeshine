@@ -4,7 +4,7 @@ permissions:
 
 # test: installer tests on a fake install folder (every push touching the patch tooling).
 # package: on a prores tag push, waits for the full CI build of that tag, then packages its sunshine.exe.
-#          Manual run: pass the id of a finished CI run that has the Vibeshine.msi artifact.
+#          Manual run: pass the id of a finished CI run that has the unsigned-msi-package-Windows artifact.
 on:
   push:
     branches:
@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Finished CI run id that has the Vibeshine.msi artifact
+        description: Finished CI run id that has the unsigned-msi-package-Windows artifact
         required: true
         type: string
 
@@ -90,9 +90,9 @@ jobs:
       - name: Download and unpack the MSI
         shell: pwsh
         run: |
-          gh run download ${{ steps.ci.outputs.run_id }} --name Vibeshine.msi --dir msi
+          gh run download ${{ steps.ci.outputs.run_id }} --name unsigned-msi-package-Windows --dir msi
           $msi = Get-ChildItem msi -Recurse -Filter *.msi | Select-Object -First 1
-          if (-not $msi) { throw 'No .msi in the Vibeshine.msi artifact' }
+          if (-not $msi) { throw 'No .msi in the unsigned-msi-package-Windows artifact' }
           $target = Join-Path $PWD 'msi-extract'
           $p = Start-Process msiexec.exe -ArgumentList '/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$target`"" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "msiexec exited with $($p.ExitCode)" }
