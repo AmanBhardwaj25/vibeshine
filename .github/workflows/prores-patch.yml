@@ -1,0 +1,125 @@
+name: prores-patch
+permissions:
+  contents: read
+
+# test: installer tests on a fake install folder (every push touching the patch tooling).
+# package: on a prores tag push, waits for the full CI build of that tag, then packages its sunshine.exe.
+#          Manual run: pass the id of a finished CI run that has the Vibeshine.msi artifact.
+on:
+  push:
+    branches:
+      - chloroframe-prores
+    paths:
+      - tools/prores/patch/**
+      - .github/workflows/prores-patch.yml
+    tags:
+      - '*-prores.*'
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Finished CI run id that has the Vibeshine.msi artifact
+        required: true
+        type: string
+
+jobs:
+  test:
+    name: Installer tests
+    if: github.repository != 'Nonary/vibeshine'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Lint (when PSScriptAnalyzer is available)
+        shell: powershell
+        run: |
+          if (Get-Module -ListAvailable -Name PSScriptAnalyzer) {
+            $r = Invoke-ScriptAnalyzer -Path tools/prores/patch -Severity Error,Warning -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions,PSUseApprovedVerbs,PSAvoidUsingEmptyCatchBlock
+            $r | Format-Table -AutoSize | Out-String | Write-Host
+            if ($r | Where-Object Severity -eq 'Error') { exit 1 }
+          } else {
+            Write-Host 'PSScriptAnalyzer not available, skipped'
+          }
+
+      - name: Installer tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./tools/prores/patch/Test-Installer.ps1
+
+  package:
+    name: Package the patch
+    needs: test
+    if: github.repository != 'Nonary/vibeshine' && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch')
+    runs-on: windows-2022
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Find the CI run
+        id: ci
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $id = '${{ inputs.run_id }}'
+          } else {
+            $id = $null
+            for ($i = 0; $i -lt 170 -and -not $id; $i++) {
+              $runs = gh run list --workflow ci.yml --branch $env:GITHUB_REF_NAME --event push --limit 20 --json databaseId,status,conclusion,headSha | ConvertFrom-Json
+              $run = $runs | Where-Object { $_.headSha -eq $env:GITHUB_SHA } | Select-Object -First 1
+              if ($run -and $run.status -eq 'completed') {
+                if ($run.conclusion -ne 'success') { throw "CI run $($run.databaseId) finished with $($run.conclusion)" }
+                $id = $run.databaseId
+              } else {
+                Start-Sleep -Seconds 60
+              }
+            }
+            if (-not $id) { throw 'Timed out waiting for the CI run of this tag.' }
+          }
+          "run_id=$id" >> $env:GITHUB_OUTPUT
+          Write-Host "Using CI run $id"
+
+      - name: Download and unpack the MSI
+        shell: pwsh
+        run: |
+          gh run download ${{ steps.ci.outputs.run_id }} --name Vibeshine.msi --dir msi
+          $msi = Get-ChildItem msi -Recurse -Filter *.msi | Select-Object -First 1
+          if (-not $msi) { throw 'No .msi in the Vibeshine.msi artifact' }
+          $target = Join-Path $PWD 'msi-extract'
+          $p = Start-Process msiexec.exe -ArgumentList '/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$target`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "msiexec exited with $($p.ExitCode)" }
+          $exes = @(Get-ChildItem $target -Recurse -Filter sunshine.exe)
+          if ($exes.Count -ne 1) { throw "Expected one sunshine.exe, found $($exes.Count)" }
+          Write-Host "sunshine.exe: $($exes[0].FullName)"
+          Write-Host "ProductVersion: $($exes[0].VersionInfo.ProductVersion)  FileVersion: $($exes[0].VersionInfo.FileVersion)"
+          "SUNSHINE_ROOT=$($exes[0].DirectoryName)" >> $env:GITHUB_ENV
+
+      - name: Build the patch
+        shell: pwsh
+        run: |
+          $base = (git rev-parse f078104b2).Trim()
+          ./tools/prores/patch/New-PatchPackage.ps1 -SunshineExe "$env:SUNSHINE_ROOT/sunshine.exe" `
+            -ShaderSource src_assets/windows/assets/shaders/directx -OutDir patch-staging -BaseCommit $base
+          $m = Get-Content patch-staging/manifest.json -Raw | ConvertFrom-Json
+          Compress-Archive -Path patch-staging/* -DestinationPath "ChloroFrame-ProRes-Patch-$($m.vibeshineVersion).zip"
+          Get-Content patch-staging/manifest.json | Write-Host
+
+      - name: Dry run against the unpacked MSI (real version string)
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File patch-staging/Install-ProResPatch.ps1 -DryRun -InstallRoot "$env:SUNSHINE_ROOT"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Upload the patch
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: chloroframe-prores-patch
+          path: ChloroFrame-ProRes-Patch-*.zip
