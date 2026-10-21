@@ -8,7 +8,7 @@
  */
 #pragma once
 
-#include "pyrowave_host.h"
+#include "src/pyrowave_host.h"
 
 namespace prores::host {
   /**

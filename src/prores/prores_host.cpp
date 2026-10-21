@@ -8,7 +8,7 @@
 
 #if !(defined(_WIN32) && defined(SUNSHINE_ENABLE_PRORES))
 
-  #include "platform/common.h"
+  #include "src/platform/common.h"
 
 namespace prores::host {
   std::unique_ptr<pyrowave::host::encoder_t> make_encoder(const pyrowave::host::session_params_t &, std::shared_ptr<platf::display_t>) {
