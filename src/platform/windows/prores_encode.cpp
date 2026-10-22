@@ -276,7 +276,8 @@ namespace prores::host {
 
   std::unique_ptr<pyrowave::host::encoder_t> make_encoder(const session_params_t &params, std::shared_ptr<platf::display_t> display) {
     if (params.framerate <= 0 || params.bitrate_kbps <= 0 || pyrowave::policy::max_frame_bytes(params.packetsize) == 0) {
-      BOOST_LOG(error) << "ProRes: invalid negotiated frame rate, bitrate or packet size"sv;
+      BOOST_LOG(error) << "ProRes: invalid negotiated frame rate, bitrate or packet size (framerate="sv << params.framerate
+                       << ", bitrate_kbps="sv << params.bitrate_kbps << ", packetsize="sv << params.packetsize << ')';
       return nullptr;
     }
     if (params.width <= 0 || params.height <= 0 || params.width > 65535 || params.height > 65535) {
