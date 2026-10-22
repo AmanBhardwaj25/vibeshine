@@ -1969,6 +1969,7 @@ namespace rtsp_stream {
     if (prores_session) {
       // ProRes frames are length-prefixed ProRes frame atoms, never PyroWave records.
       config.monitor.pyrowave_framing = pyrowave::policy::framing_e::length_prefixed;
+      config.monitor.packetsize = config.packetsize;
       config.monitor.pyrowave_min_parity_shards = std::max(2, config.minRequiredFecPackets);
       BOOST_LOG(info) << "Client requested ProRes"sv;
     }
